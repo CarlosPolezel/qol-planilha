@@ -1,532 +1,1274 @@
-import React, { useState, useEffect } from 'react';
-import * as XLSX from 'xlsx';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import './App.css';
+import {
+  CONFIG_MAQUINAS,
+  LIMITE_ESTOQUE_LITROS,
+  OPCOES_TAMANHO,
+  consumoDesmoldante,
+  gerarEstruturaDia,
+  normalizarDia,
+  type ConsumoDesmoldante,
+  type DiaColeta,
+  type MaquinaData,
+} from './domain';
 
-// ---------------------------------------------------------------------------
-// CONFIGURAÇÕES DO SETOR E MÁQUINAS (DESMA)
-// ---------------------------------------------------------------------------
-interface MaquinaConfig {
-  id: number;
-  nome: string;
-  totalPostos: number;
-}
-
-const CONFIG_MAQUINAS: MaquinaConfig[] = [
-  { id: 1, nome: 'Máquina 01', totalPostos: 30 },
-  { id: 2, nome: 'Máquina 02', totalPostos: 24 },
-  { id: 3, nome: 'Máquina 03', totalPostos: 24 },
-  { id: 4, nome: 'Máquina 04', totalPostos: 24 },
-];
-
-interface PostoData {
-  numeracaoPosto: number;
-  tamanho: number;
-  tempoRealCompacta: number;
-  tempoRealInjetada: number;
-}
-
-interface MaquinaData {
-  idMaquina: number;
-  nomeMaquina: string;
-  postos: PostoData[];
-}
-
-interface ColetaDiaria {
-  idColeta: number;
-  horarioSalvamento?: string;
-  maquinas: MaquinaData[];
-}
-
-interface BancoDadosHistorico {
-  [data: string]: ColetaDiaria[];
-}
-
-const OPCOES_TAMANHO = Array.from({ length: 16 }, (_, i) => 33 + i);
-const getTodayString = () => new Date().toISOString().split('T')[0];
-
-const gerarEstruturaDia = (): ColetaDiaria[] => {
-  const criarMaquinas = () =>
-    CONFIG_MAQUINAS.map((m) => ({
-      idMaquina: m.id,
-      nomeMaquina: m.nome,
-      postos: Array.from({ length: m.totalPostos }, (_, idx) => ({
-        numeracaoPosto: idx + 1,
-        tamanho: 33,
-        tempoRealCompacta: 0,
-        tempoRealInjetada: 0,
-      })),
-    }));
-
-  return [1, 2, 3, 4].map((idColeta) => ({
-    idColeta,
-    maquinas: criarMaquinas(),
-  }));
+type Mensagem = {
+  tipo: 'sucesso' | 'erro';
+  texto: string;
 };
 
-export default function App() {
-  const dataHoje = getTodayString();
-  const [dataSelecionada, setDataSelecionada] = useState<string>(dataHoje);
-  
-  // Controle de Módulo: 'injecao' | 'desmoldante'
-  const [moduloAtivo, setModuloAtivo] = useState<'injecao' | 'desmoldante'>('injecao');
-  const [coletaAtualIdx, setColetaAtualIdx] = useState<number>(1);
-  const [maquinaAtivaId, setMaquinaAtivaId] = useState<number>(CONFIG_MAQUINAS[0].id);
-  const [mensagem, setMensagem] = useState<string>('');
+type EstadoSalvamento = 'salvo' | 'salvando' | 'falha' | 'conflito';
+type Pagina = 'dashboard' | 'coletas';
 
-  // Persistência local
-  const [bancoDados, setBancoDados] = useState<BancoDadosHistorico>(() => {
-    const salvas = localStorage.getItem('banco_coletas_desma_clean_v6');
-    if (salvas) return JSON.parse(salvas);
-    return {};
+interface RespostaDia {
+  day: DiaColeta;
+  etag: string | null;
+  exists: boolean;
+}
+
+class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const CAMPOS_INJECAO = [
+  'Data',
+  'Coleta',
+  'Horário Registro',
+  'Máquina',
+  'Posto Nº',
+  'Tamanho',
+  'T.R. Compacta',
+  'T.R. Injetada',
+];
+
+const CHAVE_SESSAO = '/api/auth';
+const CHAVE_DADOS = '/api/data';
+
+const getTodayString = () => {
+  const hoje = new Date();
+  return `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}-${String(
+    hoje.getDate()
+  ).padStart(2, '0')}`;
+};
+
+const formatarData = (data: string) => {
+  const [ano, mes, dia] = data.split('-');
+  return `${dia}/${mes}/${ano}`;
+};
+
+const formatarLitros = (valor: number) =>
+  `${valor.toLocaleString('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 3 })} L`;
+
+const requestJson = async <T,>(input: RequestInfo | URL, init?: RequestInit): Promise<T> => {
+  const response = await fetch(input, {
+    cache: 'no-store',
+    credentials: 'same-origin',
+    ...init,
+    headers: {
+      ...(init?.headers ?? {}),
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+    },
   });
+  const payload = (await response.json().catch(() => ({}))) as T & { error?: string };
+  if (!response.ok) {
+    throw new ApiError(
+      payload.error ?? 'Não foi possível concluir a operação.',
+      response.status
+    );
+  }
+  return payload;
+};
 
-  useEffect(() => {
-    localStorage.setItem('banco_coletas_desma_clean_v6', JSON.stringify(bancoDados));
-  }, [bancoDados]);
+const importarArquivoExcel = async (arquivo: File): Promise<DiaColeta> => {
+  if (arquivo.size > 10 * 1024 * 1024) {
+    throw new Error('O arquivo deve ter no máximo 10 MB.');
+  }
+  const XLSX = await import('@e965/xlsx');
+  const workbook = XLSX.read(await arquivo.arrayBuffer(), { cellDates: false });
+  const planilhaInjecao =
+    workbook.Sheets['Injeção'] ?? workbook.Sheets[workbook.SheetNames[0]];
+  if (!planilhaInjecao) throw new Error('O arquivo não contém uma planilha de injeção.');
 
-  const coletasDoDia = bancoDados[dataSelecionada] || gerarEstruturaDia();
-  const isReadOnly = dataSelecionada !== dataHoje;
+  const linhas = XLSX.utils.sheet_to_json<Record<string, unknown>>(planilhaInjecao, {
+    defval: '',
+  });
+  if (linhas.length === 0 || !CAMPOS_INJECAO.every((campo) => campo in linhas[0])) {
+    throw new Error('Formato inválido. Selecione um arquivo diário exportado pelo sistema.');
+  }
 
-  const handleCampoChange = (
-    postoIdx: number,
-    field: 'tempoRealCompacta' | 'tempoRealInjetada' | 'tamanho',
-    value: string
-  ) => {
-    if (isReadOnly) return;
+  const data = String(linhas[0].Data ?? '');
+  const dia = gerarEstruturaDia(data);
+  const postosImportados = new Set<string>();
 
-    let parsedVal: number = 0;
-    if (field === 'tamanho') parsedVal = parseInt(value) || 33;
-    if (field === 'tempoRealCompacta' || field === 'tempoRealInjetada') parsedVal = parseFloat(value) || 0;
+  const numero = (value: unknown, campo: string) => {
+    if (value === '' || value === null || value === undefined) return 0;
+    const result = typeof value === 'number' ? value : Number(String(value).replace(',', '.'));
+    if (!Number.isFinite(result)) throw new Error(`O campo "${campo}" contém um valor inválido.`);
+    return result;
+  };
 
-    setBancoDados((prev) => {
-      const bancoAtual = { ...prev };
-      if (!bancoAtual[dataSelecionada]) {
-        bancoAtual[dataSelecionada] = gerarEstruturaDia();
+  for (const linha of linhas) {
+    if (String(linha.Data) !== data) throw new Error('O arquivo contém mais de uma data.');
+    const coletaId = Number(String(linha.Coleta).match(/^([1-4])ª Coleta$/)?.[1]);
+    const maquinaConfig = CONFIG_MAQUINAS.find(
+      (item) => item.nome === String(linha.Máquina ?? '').trim()
+    );
+    const postoNumero = numero(linha['Posto Nº'], 'Posto Nº');
+    if (
+      !coletaId ||
+      !maquinaConfig ||
+      !Number.isInteger(postoNumero) ||
+      postoNumero < 1 ||
+      postoNumero > maquinaConfig.totalPostos
+    ) {
+      throw new Error('O arquivo contém uma coleta, máquina ou posto inválido.');
+    }
+
+    const chave = `${coletaId}:${maquinaConfig.id}:${postoNumero}`;
+    if (postosImportados.has(chave)) throw new Error('O arquivo contém postos duplicados.');
+    postosImportados.add(chave);
+    const coleta = dia.coletas[coletaId - 1];
+    const maquina = coleta.maquinas[maquinaConfig.id - 1];
+    const posto = maquina.postos[postoNumero - 1];
+    posto.tamanho = numero(linha.Tamanho, 'Tamanho');
+    posto.tempoRealCompacta = numero(linha['T.R. Compacta'], 'T.R. Compacta');
+    posto.tempoRealInjetada = numero(linha['T.R. Injetada'], 'T.R. Injetada');
+
+    const horario = String(linha['Horário Registro'] ?? '').trim();
+    if (horario && horario !== 'Pendente') {
+      if (coleta.horarioSalvamento && coleta.horarioSalvamento !== horario) {
+        throw new Error(`A ${coletaId}ª coleta tem horários divergentes no arquivo.`);
       }
+      coleta.horarioSalvamento = horario;
+    }
+  }
 
-      const dia = [...bancoAtual[dataSelecionada]];
-      const coleta = dia[coletaAtualIdx - 1];
-      const maquina = coleta.maquinas.find((m) => m.idMaquina === maquinaAtivaId);
+  const totalPostos =
+    CONFIG_MAQUINAS.reduce((total, maquina) => total + maquina.totalPostos, 0) * 4;
+  if (postosImportados.size !== totalPostos) {
+    throw new Error('O arquivo está incompleto; precisa conter as quatro coletas e máquinas.');
+  }
 
-      if (maquina) {
-        maquina.postos[postoIdx][field] = parsedVal;
+  const planilhaDesmoldante = workbook.Sheets['Desmoldante'];
+  if (planilhaDesmoldante) {
+    const linhasConsumo = XLSX.utils.sheet_to_json<Record<string, unknown>>(planilhaDesmoldante, {
+      defval: '',
+    });
+    const maquinasImportadas = new Set<string>();
+
+    for (const linha of linhasConsumo) {
+      const coletaId = Number(String(linha.Coleta).match(/^([1-4])ª Coleta$/)?.[1]);
+      const maquinaConfig = CONFIG_MAQUINAS.find(
+        (item) => item.nome === String(linha.Máquina ?? '').trim()
+      );
+      if (!coletaId || !maquinaConfig || String(linha.Data) !== data) {
+        throw new Error('A planilha de desmoldante contém dados inválidos.');
       }
-
-      bancoAtual[dataSelecionada] = dia;
-      return bancoAtual;
-    });
-  };
-
-  const clonarColetaAnterior = () => {
-    if (isReadOnly || coletaAtualIdx === 1) return;
-
-    setBancoDados((prev) => {
-      const bancoAtual = { ...prev };
-      if (!bancoAtual[dataSelecionada]) return prev;
-
-      const dia = [...bancoAtual[dataSelecionada]];
-      const coletaAnterior = dia[coletaAtualIdx - 2];
-
-      dia[coletaAtualIdx - 1].maquinas = JSON.parse(JSON.stringify(coletaAnterior.maquinas));
-      bancoAtual[dataSelecionada] = dia;
-      return bancoAtual;
-    });
-    exibirMensagem(`Dados clonados da ${coletaAtualIdx - 1}ª Coleta.`);
-  };
-
-  const salvarColetaAtual = () => {
-    if (isReadOnly) return;
-    const agora = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-
-    setBancoDados((prev) => {
-      const bancoAtual = { ...prev };
-      if (!bancoAtual[dataSelecionada]) {
-        bancoAtual[dataSelecionada] = gerarEstruturaDia();
+      const chave = `${coletaId}:${maquinaConfig.id}`;
+      if (maquinasImportadas.has(chave)) {
+        throw new Error('A planilha de desmoldante contém medições duplicadas.');
       }
+      maquinasImportadas.add(chave);
+      dia.coletas[coletaId - 1].maquinas[maquinaConfig.id - 1].desmoldante = {
+        estoqueInicialL: numero(linha['Estoque Inicial (L)'], 'Estoque Inicial (L)'),
+        reposicaoL: numero(linha['Reposição (L)'], 'Reposição (L)'),
+        estoqueFinalL: numero(linha['Estoque Final (L)'], 'Estoque Final (L)'),
+      };
+    }
+    if (maquinasImportadas.size !== 16) {
+      throw new Error('A planilha de desmoldante deve ter uma linha por coleta e máquina.');
+    }
+  }
 
-      const dia = [...bancoAtual[dataSelecionada]];
-      dia[coletaAtualIdx - 1].horarioSalvamento = agora;
-      bancoAtual[dataSelecionada] = dia;
-      return bancoAtual;
-    });
-    exibirMensagem(`Coleta ${coletaAtualIdx} registrada às ${agora}.`);
+  return normalizarDia(dia, data);
+};
+
+const TelaLogin = ({
+  onLogin,
+  erro,
+  carregando,
+}: {
+  onLogin: (username: string, password: string) => Promise<void>;
+  erro: string;
+  carregando: boolean;
+}) => {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [enviando, setEnviando] = useState(false);
+
+  const entrar = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setEnviando(true);
+    try {
+      await onLogin(username.trim(), password);
+    } finally {
+      setEnviando(false);
+    }
   };
-
-  const exibirMensagem = (texto: string) => {
-    setMensagem(texto);
-    setTimeout(() => setMensagem(''), 3000);
-  };
-
-  const exportarParaExcel = () => {
-    const linhasExcel: any[] = [];
-
-    coletasDoDia.forEach((coleta) => {
-      coleta.maquinas.forEach((maquina) => {
-        maquina.postos.forEach((posto) => {
-          linhasExcel.push({
-            Data: dataSelecionada,
-            Setor: 'Desma',
-            Coleta: `${coleta.idColeta}ª Coleta`,
-            'Horário Registro': coleta.horarioSalvamento || 'Pendente',
-            Máquina: maquina.nomeMaquina,
-            'Posto Nº': posto.numeracaoPosto,
-            Tamanho: posto.tamanho,
-            'T.R. Compacta': posto.tempoRealCompacta,
-            'T.R. Injetada': posto.tempoRealInjetada,
-          });
-        });
-      });
-    });
-
-    const worksheet = XLSX.utils.json_to_sheet(linhasExcel);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Injeção');
-    XLSX.writeFile(workbook, `Injecao_Desma_${dataSelecionada}.xlsx`);
-  };
-
-  const coletaAtual = coletasDoDia[coletaAtualIdx - 1];
-  const maquinaAtual =
-    coletaAtual.maquinas.find((m) => m.idMaquina === maquinaAtivaId) || coletaAtual.maquinas[0];
 
   return (
-    <div style={{ backgroundColor: '#F8FAFC', minHeight: '100vh', fontFamily: 'system-ui, -apple-system, sans-serif', color: '#0F172A' }}>
-      
-      {/* BARRA SUPERIOR INDUSTRIAL CLEAN */}
-      <header style={{ backgroundColor: '#0F172A', color: '#FFFFFF', padding: '12px 24px', borderBottom: '3px solid #DC2626', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ fontSize: '11px', fontWeight: 700, backgroundColor: '#DC2626', color: '#FFF', padding: '2px 6px', borderRadius: '4px', letterSpacing: '0.5px' }}>SETOR DESMA</span>
-            <h1 style={{ margin: 0, fontSize: '18px', fontWeight: 600, letterSpacing: '-0.3px' }}>Sistema de Coleta Operacional</h1>
+    <main className="login-page">
+      <section className="login-card" aria-labelledby="login-title">
+        <div className="login-brand">
+          <span className="brand-mark" aria-hidden="true">D</span>
+          <p className="eyebrow">SETOR DESMA</p>
+        </div>
+        <h1 id="login-title">Acesse a coleta operacional</h1>
+        <p className="login-description">
+          Entre com o usuário do sistema para visualizar o dashboard e as coletas do setor.
+        </p>
+        {erro && <div className="feedback feedback-error" role="alert">{erro}</div>}
+        <form className="login-form" onSubmit={entrar}>
+          <label>
+            <span>Usuário</span>
+            <input
+              autoComplete="username"
+              name="username"
+              required
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Senha</span>
+            <input
+              autoComplete="current-password"
+              name="password"
+              required
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </label>
+          <button className="button button-primary login-submit" disabled={enviando || carregando}>
+            {enviando ? 'Validando acesso…' : 'Entrar'}
+          </button>
+        </form>
+        <p className="login-security-note">
+          Acesso validado pelo servidor. A sessão expira após oito horas.
+        </p>
+      </section>
+    </main>
+  );
+};
+
+const CampoLitros = ({
+  id,
+  label,
+  value,
+  disabled,
+  onChange,
+  erro,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  disabled: boolean;
+  onChange: (value: string) => void;
+  erro: string;
+}) => (
+  <label className="liters-field" htmlFor={id}>
+    <span>{label}</span>
+    <div className="liters-input-wrap">
+      <input
+        id={id}
+        type="number"
+        min="0"
+        max={LIMITE_ESTOQUE_LITROS}
+        step="0.001"
+        inputMode="decimal"
+        disabled={disabled}
+        value={value || ''}
+        placeholder="0,000"
+        aria-invalid={Boolean(erro)}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <span aria-hidden="true">L</span>
+    </div>
+    <small>{erro || `De 0 a ${LIMITE_ESTOQUE_LITROS} L; vazio equivale a zero.`}</small>
+  </label>
+);
+
+export default function App() {
+  const hoje = getTodayString();
+  const [autenticado, setAutenticado] = useState(false);
+  const [checandoSessao, setChecandoSessao] = useState(true);
+  const [erroLogin, setErroLogin] = useState('');
+  const [dataSelecionada, setDataSelecionada] = useState(hoje);
+  const [dia, setDia] = useState<DiaColeta | null>(null);
+  const etagRef = useRef<string | null>(null);
+  const [diaExiste, setDiaExiste] = useState(false);
+  const [diaCarregado, setDiaCarregado] = useState(false);
+  const [datasDisponiveis, setDatasDisponiveis] = useState<string[]>([]);
+  const [pagina, setPagina] = useState<Pagina>(
+    window.location.pathname === '/coletas' ? 'coletas' : 'dashboard'
+  );
+  const [moduloAtivo, setModuloAtivo] = useState<'injecao' | 'desmoldante'>('injecao');
+  const [coletaAtualIdx, setColetaAtualIdx] = useState(1);
+  const [maquinaAtivaId, setMaquinaAtivaId] = useState(CONFIG_MAQUINAS[0].id);
+  const [mensagem, setMensagem] = useState<Mensagem | null>(null);
+  const [estadoSalvamento, setEstadoSalvamento] = useState<EstadoSalvamento>('salvo');
+  const [erroConsumo, setErroConsumo] = useState('');
+  const arquivoInputRef = useRef<HTMLInputElement>(null);
+  const ultimoSalvamentoRef = useRef('');
+  const salvamentoEmAndamentoRef = useRef(false);
+  const temporizadorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const exibirMensagem = useCallback((texto: string, tipo: Mensagem['tipo'] = 'sucesso') => {
+    setMensagem({ texto, tipo });
+  }, []);
+
+  const carregarDatas = useCallback(async () => {
+    const resultado = await requestJson<{ dates: string[] }>(`${CHAVE_DADOS}?dates=1`);
+    setDatasDisponiveis(resultado.dates);
+  }, []);
+
+  const buscarDia = useCallback(
+    (data: string) => requestJson<RespostaDia>(`${CHAVE_DADOS}?date=${data}`),
+    []
+  );
+
+  const aplicarDia = useCallback((resultado: RespostaDia) => {
+    setDia(resultado.day);
+    etagRef.current = resultado.etag;
+    setDiaExiste(resultado.exists);
+    setDiaCarregado(true);
+    ultimoSalvamentoRef.current = JSON.stringify(resultado.day);
+    setEstadoSalvamento('salvo');
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    requestJson<{ authenticated: boolean }>(CHAVE_SESSAO)
+      .then(async (result) => {
+        if (!active) return;
+        if (result.authenticated) {
+          setAutenticado(true);
+          if (window.location.pathname === '/login') {
+            window.history.replaceState(null, '', '/dashboard');
+          }
+          await carregarDatas();
+        } else {
+          setAutenticado(false);
+          if (window.location.pathname !== '/login') {
+            window.history.replaceState(null, '', '/login');
+          }
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setErroLogin(
+            error instanceof Error
+              ? error.message
+              : 'O serviço de autenticação não está disponível.'
+          );
+        }
+      })
+      .finally(() => {
+        if (active) setChecandoSessao(false);
+      });
+
+    const handlePopState = () => {
+      const path = window.location.pathname;
+      setPagina(path === '/coletas' ? 'coletas' : 'dashboard');
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      active = false;
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, [carregarDatas]);
+
+  useEffect(() => {
+    if (!autenticado) return;
+    let active = true;
+    buscarDia(dataSelecionada)
+      .then((resultado) => {
+        if (active) aplicarDia(resultado);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setDia(null);
+        setDiaCarregado(false);
+        if (error instanceof ApiError && error.status === 401) {
+          setAutenticado(false);
+          window.history.replaceState(null, '', '/login');
+          return;
+        }
+        exibirMensagem(
+          error instanceof Error ? error.message : 'Não foi possível carregar os dados deste dia.',
+          'erro'
+        );
+      });
+    return () => {
+      active = false;
+    };
+  }, [aplicarDia, autenticado, buscarDia, dataSelecionada, exibirMensagem]);
+
+  const salvarDia = useCallback(async (diaParaSalvar: DiaColeta, avisar = false) => {
+    const data = diaParaSalvar.data;
+    const snapshot = JSON.stringify(diaParaSalvar);
+    if (snapshot === ultimoSalvamentoRef.current && diaExiste) return true;
+    if (salvamentoEmAndamentoRef.current) return false;
+    salvamentoEmAndamentoRef.current = true;
+    setEstadoSalvamento('salvando');
+    try {
+      const headers = etagRef.current ? { 'If-Match': etagRef.current } : undefined;
+      const resultado = await requestJson<RespostaDia>(`${CHAVE_DADOS}?date=${data}`, {
+        method: 'PUT',
+        headers,
+        body: snapshot,
+      });
+      etagRef.current = resultado.etag;
+      setDiaExiste(true);
+      ultimoSalvamentoRef.current = snapshot;
+      setEstadoSalvamento('salvo');
+      setDatasDisponiveis((prev) => [...new Set([data, ...prev])].sort((a, b) => b.localeCompare(a)));
+      if (avisar) exibirMensagem(`Dados de ${formatarData(data)} sincronizados com o arquivo diário.`);
+      return true;
+    } catch (error) {
+      const mensagemErro =
+        error instanceof Error ? error.message : 'Não foi possível sincronizar os dados.';
+      if (error instanceof ApiError && error.status === 401) {
+        setAutenticado(false);
+        window.history.replaceState(null, '', '/login');
+        return false;
+      }
+      setEstadoSalvamento(error instanceof ApiError && error.status === 409 ? 'conflito' : 'falha');
+      exibirMensagem(mensagemErro, 'erro');
+      return false;
+    } finally {
+      salvamentoEmAndamentoRef.current = false;
+    }
+  }, [diaExiste, exibirMensagem]);
+
+  useEffect(() => {
+    if (!autenticado || !diaCarregado || !dia || dataSelecionada !== dia.data) return;
+    const snapshot = JSON.stringify(dia);
+    if (snapshot === ultimoSalvamentoRef.current || temporizadorRef.current) return;
+    temporizadorRef.current = setTimeout(() => {
+      temporizadorRef.current = null;
+      void salvarDia(dia);
+    }, 650);
+    return () => {
+      if (temporizadorRef.current) {
+        clearTimeout(temporizadorRef.current);
+        temporizadorRef.current = null;
+      }
+    };
+  }, [autenticado, dataSelecionada, dia, diaCarregado, salvarDia]);
+
+  const entrar = async (username: string, password: string) => {
+    setErroLogin('');
+    try {
+      const resultado = await requestJson<{ authenticated: boolean }>(CHAVE_SESSAO, {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      });
+      setAutenticado(resultado.authenticated);
+      setPagina('dashboard');
+      window.history.replaceState(null, '', '/dashboard');
+      await carregarDatas();
+    } catch (error) {
+      setErroLogin(
+        error instanceof Error ? error.message : 'Não foi possível validar o acesso.'
+      );
+    }
+  };
+
+  const sair = async () => {
+    try {
+      await requestJson<{ authenticated: boolean }>(CHAVE_SESSAO, { method: 'DELETE' });
+    } catch (error) {
+      exibirMensagem(
+        error instanceof Error ? error.message : 'Não foi possível encerrar a sessão.',
+        'erro'
+      );
+      return;
+    }
+    setAutenticado(false);
+    setDia(null);
+    etagRef.current = null;
+    setDiaCarregado(false);
+    setErroLogin('');
+    window.history.replaceState(null, '', '/login');
+  };
+
+  const selecionarPagina = (novaPagina: Pagina) => {
+    setPagina(novaPagina);
+    window.history.pushState(
+      null,
+      '',
+      novaPagina === 'dashboard' ? '/dashboard' : '/coletas'
+    );
+  };
+
+  const selecionarData = async (data: string) => {
+    if (data === dataSelecionada || !data) return;
+    if (
+      dia &&
+      diaCarregado &&
+      JSON.stringify(dia) !== ultimoSalvamentoRef.current &&
+      !(await salvarDia(dia))
+    ) {
+      return;
+    }
+    setDia(null);
+    setDiaCarregado(false);
+    setDiaExiste(false);
+    etagRef.current = null;
+    setDataSelecionada(data);
+    setMensagem(null);
+  };
+
+  const atualizarDia = (transformar: (atual: DiaColeta) => DiaColeta) => {
+    if (!dia || dataSelecionada !== hoje || estadoSalvamento === 'conflito') return;
+    setEstadoSalvamento('salvando');
+    setDia((atual) => (atual ? transformar(atual) : atual));
+  };
+
+  const atualizarCampoPosto = (
+    postoIdx: number,
+    campo: 'tempoRealCompacta' | 'tempoRealInjetada' | 'tamanho',
+    valor: string
+  ) => {
+    const numero = campo === 'tamanho' ? Number.parseInt(valor, 10) : Number(valor);
+    const valorSeguro = Number.isFinite(numero) ? numero : 0;
+    atualizarDia((atual) => ({
+      ...atual,
+      coletas: atual.coletas.map((coleta) =>
+        coleta.idColeta !== coletaAtualIdx
+          ? coleta
+          : {
+              ...coleta,
+              maquinas: coleta.maquinas.map((maquina) =>
+                maquina.idMaquina !== maquinaAtivaId
+                  ? maquina
+                  : {
+                      ...maquina,
+                      postos: maquina.postos.map((posto, index) =>
+                        index === postoIdx ? { ...posto, [campo]: valorSeguro } : posto
+                      ),
+                    }
+              ),
+            }
+      ),
+    }));
+  };
+
+  const atualizarConsumo = (
+    campo: keyof ConsumoDesmoldante,
+    valorTexto: string,
+    maquina: MaquinaData
+  ) => {
+    if (!dia || dataSelecionada !== hoje) return;
+    const valor = valorTexto.trim() === '' ? 0 : Number(valorTexto.replace(',', '.'));
+    if (!Number.isFinite(valor) || valor < 0 || valor > LIMITE_ESTOQUE_LITROS) {
+      setErroConsumo(`Informe um valor entre 0 e ${LIMITE_ESTOQUE_LITROS} L.`);
+      return;
+    }
+
+    const arredondado = Math.round((valor + Number.EPSILON) * 1000) / 1000;
+    const consumoAtualizado = { ...maquina.desmoldante, [campo]: arredondado };
+    if (consumoDesmoldante(consumoAtualizado) < 0) {
+      setErroConsumo('O estoque final não pode exceder o estoque inicial mais a reposição.');
+      return;
+    }
+
+    setErroConsumo('');
+    atualizarDia((atual) => ({
+      ...atual,
+      coletas: atual.coletas.map((coleta) =>
+        coleta.idColeta !== coletaAtualIdx
+          ? coleta
+          : {
+              ...coleta,
+              maquinas: coleta.maquinas.map((item) =>
+                item.idMaquina === maquinaAtivaId
+                  ? { ...item, desmoldante: consumoAtualizado }
+                  : item
+              ),
+            }
+      ),
+    }));
+  };
+
+  const copiarColetaAnterior = () => {
+    if (!dia || coletaAtualIdx === 1 || dataSelecionada !== hoje) return;
+    const coletaAtual = dia.coletas[coletaAtualIdx - 1];
+    const preenchida = coletaAtual.maquinas.some(
+      (maquina) =>
+        maquina.postos.some(
+          (posto) =>
+            posto.tamanho !== 33 ||
+            posto.tempoRealCompacta !== 0 ||
+            posto.tempoRealInjetada !== 0
+        ) ||
+        Object.values(maquina.desmoldante).some((valor) => valor !== 0)
+    );
+    if (
+      (preenchida || coletaAtual.horarioSalvamento) &&
+      !window.confirm('Esta coleta já tem dados. Deseja substituí-los pela coleta anterior?')
+    ) {
+      return;
+    }
+    atualizarDia((atual) => ({
+      ...atual,
+      coletas: atual.coletas.map((coleta, index) =>
+        index === coletaAtualIdx - 1
+          ? {
+              ...coleta,
+              horarioSalvamento: undefined,
+              maquinas: atual.coletas[index - 1].maquinas.map((maquina) => ({
+                ...maquina,
+                postos: maquina.postos.map((posto) => ({ ...posto })),
+                desmoldante: { ...maquina.desmoldante },
+              })),
+            }
+          : coleta
+      ),
+    }));
+    exibirMensagem(`Dados copiados da ${coletaAtualIdx - 1}ª coleta.`);
+  };
+
+  const registrarColeta = async () => {
+    if (!dia || dataSelecionada !== hoje) return;
+    const horario = new Date().toLocaleTimeString('pt-BR', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    const atualizado: DiaColeta = {
+      ...dia,
+      coletas: dia.coletas.map((coleta) =>
+        coleta.idColeta === coletaAtualIdx
+          ? { ...coleta, horarioSalvamento: horario }
+          : coleta
+      ),
+    };
+    setDia(atualizado);
+    const salvo = await salvarDia(atualizado);
+    if (salvo) exibirMensagem(`Coleta ${coletaAtualIdx} registrada às ${horario}.`);
+  };
+
+  const importarExcel = async (event: ChangeEvent<HTMLInputElement>) => {
+    const arquivo = event.target.files?.[0];
+    event.target.value = '';
+    if (!arquivo) return;
+
+    try {
+      const importado = await importarArquivoExcel(arquivo);
+      const atual = await requestJson<RespostaDia>(`${CHAVE_DADOS}?date=${importado.data}`);
+      if (
+        atual.exists &&
+        !window.confirm(
+          `Já existe um arquivo compartilhado de ${formatarData(importado.data)}. Deseja substituí-lo?`
+        )
+      ) {
+        return;
+      }
+      etagRef.current = atual.etag;
+      const salvo = await salvarDia(importado, true);
+      if (!salvo) return;
+      setDataSelecionada(importado.data);
+      setDia(importado);
+      setDiaExiste(true);
+      setDiaCarregado(true);
+      ultimoSalvamentoRef.current = JSON.stringify(importado);
+      setModuloAtivo('injecao');
+      setPagina('coletas');
+      window.history.pushState(null, '', '/coletas');
+      exibirMensagem(`Arquivo ${arquivo.name} importado para o histórico compartilhado.`);
+    } catch (error) {
+      exibirMensagem(
+        error instanceof Error ? error.message : 'Não foi possível importar o arquivo.',
+        'erro'
+      );
+    }
+  };
+
+  const exportarExcel = async () => {
+    if (!dia) return;
+    if (!diaExiste && !(await salvarDia(dia))) return;
+    if (JSON.stringify(dia) !== ultimoSalvamentoRef.current && !(await salvarDia(dia))) return;
+    try {
+      const response = await fetch(`${CHAVE_DADOS}?date=${dataSelecionada}&download=1`, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(payload.error ?? 'Não foi possível baixar o arquivo diário.');
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Coleta_Desma_${dataSelecionada}.xlsx`;
+      link.click();
+      URL.revokeObjectURL(url);
+      exibirMensagem(`Arquivo diário de ${formatarData(dataSelecionada)} exportado.`);
+    } catch (error) {
+      exibirMensagem(
+        error instanceof Error ? error.message : 'Não foi possível exportar o arquivo.',
+        'erro'
+      );
+    }
+  };
+
+  const recarregarDoServidor = async () => {
+    if (
+      window.confirm('Isso descarta as alterações locais ainda não sincronizadas. Deseja continuar?')
+    ) {
+      setMensagem(null);
+      try {
+        aplicarDia(await buscarDia(dataSelecionada));
+      } catch (error) {
+        exibirMensagem(
+          error instanceof Error ? error.message : 'Não foi possível recarregar os dados.',
+          'erro'
+        );
+      }
+    }
+  };
+
+  const coletaAtual = dia?.coletas[coletaAtualIdx - 1];
+  const maquinaAtual =
+    coletaAtual?.maquinas.find((maquina) => maquina.idMaquina === maquinaAtivaId) ??
+    coletaAtual?.maquinas[0];
+
+  const resumo = useMemo(() => {
+    const porMaquina = CONFIG_MAQUINAS.map((configuracao) => {
+      const maquinaColetas =
+        dia?.coletas.flatMap((coleta) =>
+          coleta.maquinas.filter((maquina) => maquina.idMaquina === configuracao.id)
+        ) ?? [];
+      return {
+        ...configuracao,
+        consumo: maquinaColetas.reduce(
+          (total, maquina) => total + consumoDesmoldante(maquina.desmoldante),
+          0
+        ),
+      };
+    });
+    return {
+      porMaquina,
+      totalConsumo: porMaquina.reduce((total, maquina) => total + maquina.consumo, 0),
+      coletasRegistradas: dia?.coletas.filter((coleta) => coleta.horarioSalvamento).length ?? 0,
+    };
+  }, [dia]);
+
+  if (checandoSessao) {
+    return (
+      <main className="session-loading" role="status">
+        <span className="loading-spinner" aria-hidden="true" />
+        <p>Verificando acesso ao sistema…</p>
+      </main>
+    );
+  }
+
+  if (!autenticado) {
+    return (
+      <TelaLogin
+        onLogin={entrar}
+        erro={erroLogin}
+        carregando={checandoSessao}
+      />
+    );
+  }
+
+  const somenteLeitura = dataSelecionada !== hoje;
+  const semHistorico = somenteLeitura && !diaExiste;
+  const erroSincronizacao = estadoSalvamento === 'conflito';
+
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="header-brand">
+          <span className="brand-mark" aria-hidden="true">D</span>
+          <div>
+            <p className="eyebrow">SETOR DESMA</p>
+            <h1>Coleta operacional</h1>
           </div>
         </div>
-
-        {/* SELETOR DE DATA / HISTÓRICO */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#1E293B', padding: '4px 10px', borderRadius: '6px', border: '1px solid #334155' }}>
-          <span style={{ fontSize: '12px', color: '#94A3B8', fontWeight: 500 }}>Data do Registro:</span>
+        <div className="header-tools">
+          <label className="date-field" htmlFor="collection-date">
+            <span>Data dos dados</span>
+            <select
+              id="collection-date"
+              value={dataSelecionada}
+              onChange={(event) => void selecionarData(event.target.value)}
+            >
+              {[...new Set([hoje, ...datasDisponiveis])]
+                .sort((a, b) => b.localeCompare(a))
+                .map((data) => (
+                  <option key={data} value={data}>
+                    {data === hoje ? `Hoje · ${formatarData(data)}` : formatarData(data)}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <span className={`sync-status sync-${estadoSalvamento}`} role="status">
+            <span aria-hidden="true" />
+            {estadoSalvamento === 'salvando'
+              ? 'Sincronizando'
+              : estadoSalvamento === 'conflito'
+                ? 'Conflito de edição'
+                : estadoSalvamento === 'falha'
+                  ? 'Falha ao sincronizar'
+                  : 'Sincronizado'}
+          </span>
+          <button
+            className="button button-header"
+            type="button"
+            onClick={() => arquivoInputRef.current?.click()}
+          >
+            Importar Excel
+          </button>
+          <button className="button button-header" type="button" onClick={() => void sair()}>
+            Sair
+          </button>
           <input
-            type="date"
-            value={dataSelecionada}
-            onChange={(e) => setDataSelecionada(e.target.value)}
-            style={{
-              padding: '4px 8px',
-              borderRadius: '4px',
-              border: '1px solid #475569',
-              backgroundColor: '#0F172A',
-              color: '#FFFFFF',
-              WebkitTextFillColor: '#FFFFFF',
-              fontSize: '13px',
-              fontWeight: 600,
-            }}
+            ref={arquivoInputRef}
+            className="visually-hidden"
+            type="file"
+            accept=".xlsx,.xls"
+            aria-label="Selecionar arquivo diário de Excel para importar"
+            onChange={(event) => void importarExcel(event)}
           />
         </div>
       </header>
 
-      <main style={{ maxWidth: '1000px', margin: '0 auto', padding: '20px' }}>
-        
-        {/* AVISO DE MODO HISTÓRICO */}
-        {isReadOnly && (
-          <div style={{ backgroundColor: '#FEF2F2', color: '#991B1B', border: '1px solid #FCA5A5', padding: '10px 14px', borderRadius: '6px', marginBottom: '16px', fontSize: '13px', fontWeight: 500 }}>
-            <strong>Modo Consulta (Histórico):</strong> Exibindo dados salvos do dia {dataSelecionada}. Apenas leitura.
-          </div>
-        )}
-
-        {/* NAVEGAÇÃO DE MÓDULOS (ABAS SUPERIORES) */}
-        <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', borderBottom: '2px solid #E2E8F0', paddingBottom: '2px' }}>
+      <main className="main-content">
+        <nav className="main-nav" aria-label="Navegação principal">
           <button
-            onClick={() => setModuloAtivo('injecao')}
-            style={{
-              padding: '8px 16px',
-              fontSize: '14px',
-              fontWeight: 600,
-              borderRadius: '6px 6px 0 0',
-              border: 'none',
-              cursor: 'pointer',
-              backgroundColor: moduloAtivo === 'injecao' ? '#0F172A' : 'transparent',
-              color: moduloAtivo === 'injecao' ? '#FFFFFF' : '#64748B',
-              transition: 'all 0.15s ease',
-            }}
+            type="button"
+            className={`main-nav-link ${pagina === 'dashboard' ? 'is-active' : ''}`}
+            aria-current={pagina === 'dashboard' ? 'page' : undefined}
+            onClick={() => selecionarPagina('dashboard')}
           >
-            Tabela de Injeção
+            Visão do dia
           </button>
-          
           <button
-            onClick={() => setModuloAtivo('desmoldante')}
-            style={{
-              padding: '8px 16px',
-              fontSize: '14px',
-              fontWeight: 600,
-              borderRadius: '6px 6px 0 0',
-              border: 'none',
-              cursor: 'pointer',
-              backgroundColor: moduloAtivo === 'desmoldante' ? '#0F172A' : 'transparent',
-              color: moduloAtivo === 'desmoldante' ? '#FFFFFF' : '#64748B',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
+            type="button"
+            className={`main-nav-link ${pagina === 'coletas' ? 'is-active' : ''}`}
+            aria-current={pagina === 'coletas' ? 'page' : undefined}
+            onClick={() => selecionarPagina('coletas')}
           >
-            Desmoldante
-            <span style={{ fontSize: '10px', backgroundColor: '#E2E8F0', color: '#475569', padding: '2px 6px', borderRadius: '10px', fontWeight: 500 }}>Em Breve</span>
+            Coletas
           </button>
-        </div>
+        </nav>
 
-        {/* =================================================================== */}
-        {/* CONTEÚDO 1: TABELA DE INJEÇÃO (MÓDULO ATIVO) */}
-        {/* =================================================================== */}
-        {moduloAtivo === 'injecao' && (
-          <div>
-            {/* SUB-NAVEGAÇÃO: CICLOS DE COLETA (1ª a 4ª) */}
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-              {[1, 2, 3, 4].map((num) => {
-                const finalizada = Boolean(coletasDoDia[num - 1]?.horarioSalvamento);
-                const selecionada = coletaAtualIdx === num;
-
-                return (
-                  <button
-                    key={num}
-                    onClick={() => setColetaAtualIdx(num)}
-                    style={{
-                      flex: 1,
-                      padding: '10px 8px',
-                      fontSize: '13px',
-                      fontWeight: 600,
-                      borderRadius: '6px',
-                      border: selecionada ? '2px solid #0F172A' : '1px solid #CBD5E1',
-                      cursor: 'pointer',
-                      backgroundColor: selecionada ? '#0F172A' : '#FFFFFF',
-                      color: selecionada ? '#FFFFFF' : '#334155',
-                      display: 'flex',
-                      justifyContent: 'center',
-                      alignItems: 'center',
-                      gap: '6px',
-                    }}
-                  >
-                    <span>{num}ª Coleta</span>
-                    {finalizada && <span style={{ color: selecionada ? '#4ADE80' : '#16A34A', fontSize: '12px' }}>✓</span>}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* SUB-NAVEGAÇÃO: SELETOR DE MÁQUINAS */}
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
-              {CONFIG_MAQUINAS.map((m) => {
-                const ativa = maquinaAtivaId === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => setMaquinaAtivaId(m.id)}
-                    style={{
-                      flex: 1,
-                      padding: '8px',
-                      fontSize: '13px',
-                      fontWeight: 600,
-                      borderRadius: '6px',
-                      border: '1px solid #CBD5E1',
-                      cursor: 'pointer',
-                      backgroundColor: ativa ? '#FFFFFF' : '#F1F5F9',
-                      color: ativa ? '#DC2626' : '#475569',
-                      borderBottom: ativa ? '3px solid #DC2626' : '1px solid #CBD5E1',
-                    }}
-                  >
-                    {m.nome} <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 400 }}>({m.totalPostos} postos)</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* BARRA DE AÇÕES */}
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
-              {coletaAtualIdx > 1 && (
-                <button
-                  onClick={clonarColetaAnterior}
-                  disabled={isReadOnly}
-                  style={{
-                    padding: '9px 16px',
-                    backgroundColor: isReadOnly ? '#E2E8F0' : '#FFFFFF',
-                    color: isReadOnly ? '#94A3B8' : '#334155',
-                    border: '1px solid #CBD5E1',
-                    borderRadius: '6px',
-                    fontWeight: 600,
-                    fontSize: '13px',
-                    cursor: isReadOnly ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  Copiar Coleta Anterior
-                </button>
-              )}
-              <button
-                onClick={salvarColetaAtual}
-                disabled={isReadOnly}
-                style={{
-                  padding: '9px 18px',
-                  backgroundColor: isReadOnly ? '#CBD5E1' : '#DC2626',
-                  color: '#FFFFFF',
-                  border: 'none',
-                  borderRadius: '6px',
-                  fontWeight: 600,
-                  fontSize: '13px',
-                  cursor: isReadOnly ? 'not-allowed' : 'pointer',
-                }}
-              >
-                Salvar Coleta {coletaAtualIdx}
-              </button>
-              <button
-                onClick={exportarParaExcel}
-                style={{
-                  padding: '9px 16px',
-                  backgroundColor: '#0F172A',
-                  color: '#FFFFFF',
-                  border: 'none',
-                  borderRadius: '6px',
-                  fontWeight: 600,
-                  fontSize: '13px',
-                  cursor: 'pointer',
-                  marginLeft: 'auto',
-                }}
-              >
-                Exportar Excel (.xlsx)
-              </button>
-            </div>
-
-            {/* MENSAGEM DE FEEDBACK */}
-            {mensagem && (
-              <div style={{ padding: '8px 12px', backgroundColor: '#F0FDF4', color: '#166534', border: '1px solid #BBF7D0', borderRadius: '6px', marginBottom: '16px', fontSize: '13px', fontWeight: 500 }}>
-                {mensagem}
-              </div>
-            )}
-
-            {/* TABELA PRINCIPAL DE DADOS DE INJEÇÃO */}
-            <div style={{ backgroundColor: '#FFFFFF', borderRadius: '8px', border: '1px solid #E2E8F0', overflow: 'hidden' }}>
-              <div style={{ padding: '12px 16px', backgroundColor: '#F8FAFC', borderBottom: '1px solid #E2E8F0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontWeight: 600, fontSize: '14px', color: '#0F172A' }}>
-                  {maquinaAtual.nomeMaquina} — Tabela de Injeção
-                </span>
-                <span style={{ fontSize: '12px', color: '#64748B' }}>
-                  {maquinaAtual.postos.length} postos em exibição
-                </span>
-              </div>
-
-              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
-                <thead>
-                  <tr style={{ backgroundColor: '#F1F5F9', color: '#475569', borderBottom: '1px solid #E2E8F0', textTransform: 'uppercase', fontSize: '11px', letterSpacing: '0.5px' }}>
-                    <th style={{ padding: '10px 16px', width: '20%' }}>Posto</th>
-                    <th style={{ padding: '10px 16px', width: '25%' }}>Tamanho</th>
-                    <th style={{ padding: '10px 16px', width: '27%' }}>Tempo Real Compacta</th>
-                    <th style={{ padding: '10px 16px', width: '28%' }}>Tempo Real Injetada</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {maquinaAtual.postos.map((posto, idx) => (
-                    <tr
-                      key={posto.numeracaoPosto}
-                      style={{
-                        borderBottom: '1px solid #F1F5F9',
-                        backgroundColor: idx % 2 === 0 ? '#FFFFFF' : '#FAFAFA',
-                      }}
-                    >
-                      <td style={{ padding: '10px 16px', fontWeight: 600, color: '#0F172A' }}>
-                        Posto {posto.numeracaoPosto}
-                      </td>
-
-                      {/* Tamanho */}
-                      <td style={{ padding: '8px 16px' }}>
-                        <select
-                          value={posto.tamanho}
-                          disabled={isReadOnly}
-                          onChange={(e) => handleCampoChange(idx, 'tamanho', e.target.value)}
-                          style={{
-                            padding: '6px 10px',
-                            fontSize: '13px',
-                            fontWeight: 600,
-                            borderRadius: '4px',
-                            border: '1px solid #CBD5E1',
-                            backgroundColor: isReadOnly ? '#F1F5F9' : '#FFFFFF',
-                            color: '#0F172A',
-                            WebkitTextFillColor: '#0F172A',
-                            cursor: isReadOnly ? 'not-allowed' : 'pointer',
-                          }}
-                        >
-                          {OPCOES_TAMANHO.map((tam) => (
-                            <option key={tam} value={tam} style={{ color: '#0F172A', backgroundColor: '#FFFFFF' }}>
-                              Nº {tam}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-
-                      {/* Tempo Real Compacta */}
-                      <td style={{ padding: '8px 16px' }}>
-                        <input
-                          type="number"
-                          step="0.01"
-                          disabled={isReadOnly}
-                          value={posto.tempoRealCompacta || ''}
-                          onChange={(e) => handleCampoChange(idx, 'tempoRealCompacta', e.target.value)}
-                          placeholder="0.00"
-                          style={{
-                            width: '110px',
-                            padding: '6px 10px',
-                            fontSize: '13px',
-                            borderRadius: '4px',
-                            border: '1px solid #CBD5E1',
-                            backgroundColor: isReadOnly ? '#F1F5F9' : '#FFFFFF',
-                            color: '#0F172A',
-                            WebkitTextFillColor: '#0F172A',
-                            fontWeight: 600,
-                          }}
-                        />
-                      </td>
-
-                      {/* Tempo Real Injetada */}
-                      <td style={{ padding: '8px 16px' }}>
-                        <input
-                          type="number"
-                          step="0.01"
-                          disabled={isReadOnly}
-                          value={posto.tempoRealInjetada || ''}
-                          onChange={(e) => handleCampoChange(idx, 'tempoRealInjetada', e.target.value)}
-                          placeholder="0.00"
-                          style={{
-                            width: '110px',
-                            padding: '6px 10px',
-                            fontSize: '13px',
-                            borderRadius: '4px',
-                            border: '1px solid #CBD5E1',
-                            backgroundColor: isReadOnly ? '#F1F5F9' : '#FFFFFF',
-                            color: '#0F172A',
-                            WebkitTextFillColor: '#0F172A',
-                            fontWeight: 600,
-                          }}
-                        />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* =================================================================== */}
-        {/* CONTEÚDO 2: DESMOLDANTE (ESPAÇO EM DESENVOLVIMENTO) */}
-        {/* =================================================================== */}
-        {moduloAtivo === 'desmoldante' && (
-          <div style={{ backgroundColor: '#FFFFFF', borderRadius: '8px', border: '1px solid #E2E8F0', padding: '60px 20px', textAlign: 'center' }}>
-            <div style={{ maxWidth: '400px', margin: '0 auto' }}>
-              <div style={{ fontSize: '32px', marginBottom: '12px' }}>🧪</div>
-              <h3 style={{ margin: '0 0 8px 0', fontSize: '18px', fontWeight: 600, color: '#0F172A' }}>
-                Planilha de Desmoldante
-              </h3>
-              <p style={{ margin: '0 0 20px 0', fontSize: '14px', color: '#64748B', lineHeight: '1.5' }}>
-                Este espaço foi reservado para a futura coleta e controle da aplicação de desmoldante por máquina.
-              </p>
-              <span style={{ display: 'inline-block', backgroundColor: '#F1F5F9', color: '#475569', fontSize: '12px', fontWeight: 600, padding: '6px 14px', borderRadius: '20px', border: '1px solid #CBD5E1' }}>
-                Em Desenvolvimento
+        {somenteLeitura && (
+          <div className="notice notice-history" role="status">
+            <span className="notice-icon" aria-hidden="true">i</span>
+            <p>
+              <strong>Consulta histórica</strong>
+              <span>
+                {semHistorico
+                  ? `Não há arquivo diário compartilhado para ${formatarData(dataSelecionada)}.`
+                  : `Exibindo os dados compartilhados de ${formatarData(dataSelecionada)} em modo somente leitura.`}
               </span>
-            </div>
+            </p>
           </div>
         )}
 
+        {erroSincronizacao && (
+          <div className="feedback feedback-error conflict-feedback" role="alert">
+            <span>O arquivo foi atualizado por outro acesso. Recarregue antes de continuar.</span>
+            <button className="button button-secondary" type="button" onClick={() => void recarregarDoServidor()}>
+              Recarregar dados compartilhados
+            </button>
+          </div>
+        )}
+
+        {mensagem && (
+          <div
+            className={`feedback feedback-${mensagem.tipo}`}
+            role={mensagem.tipo === 'erro' ? 'alert' : 'status'}
+            aria-live={mensagem.tipo === 'erro' ? 'assertive' : 'polite'}
+          >
+            {mensagem.texto}
+          </div>
+        )}
+
+        {!diaCarregado || !dia ? (
+          <div className="data-loading" role="status">
+            <span className="loading-spinner" aria-hidden="true" />
+            <p>Carregando arquivo diário compartilhado…</p>
+          </div>
+        ) : pagina === 'dashboard' ? (
+          <section className="dashboard-view">
+            <div className="page-heading">
+              <div>
+                <p className="eyebrow">ACOMPANHAMENTO OPERACIONAL</p>
+                <h2>Resumo do dia</h2>
+                <p className="page-description">
+                  Indicadores das quatro máquinas em {formatarData(dataSelecionada)}.
+                </p>
+              </div>
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => selecionarPagina('coletas')}
+              >
+                Abrir coletas
+              </button>
+            </div>
+
+            {semHistorico ? (
+              <div className="empty-state dashboard-empty">
+                <span className="empty-state-icon" aria-hidden="true">↥</span>
+                <h2>Não há dados para este dia</h2>
+                <p>Importe um arquivo diário para consultar os indicadores do histórico.</p>
+                <button className="button button-primary" onClick={() => arquivoInputRef.current?.click()}>
+                  Importar arquivo diário
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="dashboard-cards">
+                  <article className="metric-card">
+                    <span className="metric-label">Coletas registradas</span>
+                    <strong>{resumo.coletasRegistradas}<small> / 4</small></strong>
+                    <span className="metric-footnote">no dia selecionado</span>
+                  </article>
+                  <article className="metric-card metric-card-highlight">
+                    <span className="metric-label">Consumo total de desmoldante</span>
+                    <strong>{formatarLitros(resumo.totalConsumo)}</strong>
+                    <span className="metric-footnote">soma das medições das quatro máquinas</span>
+                  </article>
+                  <article className="metric-card">
+                    <span className="metric-label">Máquinas acompanhadas</span>
+                    <strong>4</strong>
+                    <span className="metric-footnote">Máquina 01 a Máquina 04</span>
+                  </article>
+                </div>
+
+                <section className="dashboard-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="eyebrow">DESMOLDANTE</p>
+                      <h3>Consumo por máquina</h3>
+                    </div>
+                    <span className="panel-total">Total: {formatarLitros(resumo.totalConsumo)}</span>
+                  </div>
+                  <div className="machine-summary-list">
+                    {resumo.porMaquina.map((maquina) => {
+                      const percentual =
+                        resumo.totalConsumo > 0
+                          ? Math.min((maquina.consumo / resumo.totalConsumo) * 100, 100)
+                          : 0;
+                      return (
+                        <article className="machine-summary" key={maquina.id}>
+                          <div className="machine-summary-heading">
+                            <strong>{maquina.nome}</strong>
+                            <span>{formatarLitros(maquina.consumo)}</span>
+                          </div>
+                          <div
+                            className="consumption-track"
+                            role="img"
+                            aria-label={`${maquina.nome}: ${formatarLitros(maquina.consumo)}`}
+                          >
+                            <span style={{ width: `${percentual}%` }} />
+                          </div>
+                          <p>
+                            {maquina.totalPostos} postos
+                            <span aria-hidden="true"> · </span>
+                            {dia.coletas.filter((coleta) => coleta.horarioSalvamento).length} coletas registradas
+                          </p>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  <p className="formula-note">
+                    Consumo = estoque inicial + reposição − estoque final, somado por coleta.
+                  </p>
+                </section>
+              </>
+            )}
+          </section>
+        ) : (
+          <section className="collection-view" aria-label="Coletas operacionais">
+            <div className="page-heading collection-page-heading">
+              <div>
+                <p className="eyebrow">REGISTRO OPERACIONAL</p>
+                <h2>Coletas</h2>
+                <p className="page-description">
+                  Selecione a coleta e a máquina para preencher os dados do dia.
+                </p>
+              </div>
+              <button className="button button-export" type="button" onClick={() => void exportarExcel()}>
+                Exportar dia para Excel
+              </button>
+            </div>
+
+            {semHistorico ? (
+              <div className="empty-state">
+                <span className="empty-state-icon" aria-hidden="true">↥</span>
+                <h2>Este dia ainda não está no histórico compartilhado</h2>
+                <p>Importe o arquivo Excel daquele dia para consultar as quatro máquinas.</p>
+                <button
+                  className="button button-primary"
+                  type="button"
+                  onClick={() => arquivoInputRef.current?.click()}
+                >
+                  Importar arquivo diário
+                </button>
+              </div>
+            ) : (
+              <>
+                <nav className="module-tabs" aria-label="Tipo de coleta">
+                  <button
+                    className={`module-tab ${moduloAtivo === 'injecao' ? 'is-active' : ''}`}
+                    type="button"
+                    aria-pressed={moduloAtivo === 'injecao'}
+                    onClick={() => setModuloAtivo('injecao')}
+                  >
+                    Injeção
+                  </button>
+                  <button
+                    className={`module-tab ${moduloAtivo === 'desmoldante' ? 'is-active' : ''}`}
+                    type="button"
+                    aria-pressed={moduloAtivo === 'desmoldante'}
+                    onClick={() => setModuloAtivo('desmoldante')}
+                  >
+                    Desmoldante
+                  </button>
+                </nav>
+
+                <section className="selection-section" aria-label="Selecionar coleta">
+                  <div className="section-heading">
+                    <div>
+                      <p className="eyebrow">ETAPA 1</p>
+                      <h2>Selecione a coleta</h2>
+                    </div>
+                    <span className="section-context">{formatarData(dataSelecionada)}</span>
+                  </div>
+                  <div className="collection-selector">
+                    {dia.coletas.map((coleta) => {
+                      const selecionada = coletaAtualIdx === coleta.idColeta;
+                      return (
+                        <button
+                          key={coleta.idColeta}
+                          className={`collection-option ${selecionada ? 'is-active' : ''}`}
+                          type="button"
+                          aria-pressed={selecionada}
+                          onClick={() => setColetaAtualIdx(coleta.idColeta)}
+                        >
+                          <span className="option-main">
+                            <span className="option-number">{coleta.idColeta}</span>
+                            <span className="option-label">{coleta.idColeta}ª coleta</span>
+                          </span>
+                          <span className={`collection-status ${coleta.horarioSalvamento ? 'is-done' : ''}`}>
+                            <span className="status-dot" aria-hidden="true" />
+                            {coleta.horarioSalvamento
+                              ? `Registrada às ${coleta.horarioSalvamento}`
+                              : 'Não registrada'}
+                          </span>
+                          {selecionada && <span className="selected-indicator">Selecionada</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                <section className="machine-section" aria-label="Selecionar máquina">
+                  <div className="section-heading section-heading-compact">
+                    <div>
+                      <p className="eyebrow">ETAPA 2</p>
+                      <h2>Selecione a máquina</h2>
+                    </div>
+                  </div>
+                  <div className="machine-selector">
+                    {CONFIG_MAQUINAS.map((maquina) => (
+                      <button
+                        key={maquina.id}
+                        className={`machine-option ${maquinaAtivaId === maquina.id ? 'is-active' : ''}`}
+                        type="button"
+                        aria-pressed={maquinaAtivaId === maquina.id}
+                        onClick={() => setMaquinaAtivaId(maquina.id)}
+                      >
+                        <span>{maquina.nome}</span>
+                        <span className="machine-post-count">{maquina.totalPostos} postos</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <div className="action-bar">
+                  <div className="action-group">
+                    {coletaAtualIdx > 1 && !somenteLeitura && (
+                      <button
+                        className="button button-secondary"
+                        type="button"
+                        disabled={erroSincronizacao}
+                        onClick={copiarColetaAnterior}
+                      >
+                        Copiar coleta anterior
+                      </button>
+                    )}
+                    {!somenteLeitura && (
+                      <button
+                        className="button button-primary"
+                        type="button"
+                        disabled={erroSincronizacao}
+                        onClick={() => void registrarColeta()}
+                      >
+                        Registrar coleta {coletaAtualIdx}
+                      </button>
+                    )}
+                  </div>
+                  <span className="save-hint">
+                    Dados sincronizados com o arquivo Excel diário compartilhado.
+                  </span>
+                </div>
+
+                {moduloAtivo === 'injecao' && maquinaAtual && coletaAtual && (
+                  <section className="table-card" aria-label="Dados dos postos">
+                    <div className="table-heading">
+                      <div>
+                        <p className="eyebrow">INJEÇÃO · PREENCHIMENTO</p>
+                        <h2>{maquinaAtual.nomeMaquina}</h2>
+                      </div>
+                      <span className="table-meta">
+                        {coletaAtual.idColeta}ª coleta <span aria-hidden="true">·</span>{' '}
+                        {maquinaAtual.postos.length} postos
+                      </span>
+                    </div>
+                    <div className="table-scroll">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Posto</th>
+                            <th scope="col">Tamanho</th>
+                            <th scope="col">Tempo real compacta</th>
+                            <th scope="col">Tempo real injetada</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {maquinaAtual.postos.map((posto, index) => (
+                            <tr key={posto.numeracaoPosto}>
+                              <th scope="row">Posto {posto.numeracaoPosto}</th>
+                              <td>
+                                <select
+                                  aria-label={`Tamanho do posto ${posto.numeracaoPosto}`}
+                                  value={posto.tamanho}
+                                  disabled={somenteLeitura || erroSincronizacao}
+                                  onChange={(event) =>
+                                    atualizarCampoPosto(index, 'tamanho', event.target.value)
+                                  }
+                                >
+                                  {OPCOES_TAMANHO.map((tamanho) => (
+                                    <option key={tamanho} value={tamanho}>Nº {tamanho}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td>
+                                <input
+                                  aria-label={`Tempo real compacta do posto ${posto.numeracaoPosto}`}
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  inputMode="decimal"
+                                  disabled={somenteLeitura || erroSincronizacao}
+                                  value={posto.tempoRealCompacta || ''}
+                                  placeholder="0,00"
+                                  onChange={(event) =>
+                                    atualizarCampoPosto(index, 'tempoRealCompacta', event.target.value)
+                                  }
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  aria-label={`Tempo real injetada do posto ${posto.numeracaoPosto}`}
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  inputMode="decimal"
+                                  disabled={somenteLeitura || erroSincronizacao}
+                                  value={posto.tempoRealInjetada || ''}
+                                  placeholder="0,00"
+                                  onChange={(event) =>
+                                    atualizarCampoPosto(index, 'tempoRealInjetada', event.target.value)
+                                  }
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="table-footer">
+                      Os registros das quatro máquinas e coletas ficam no arquivo diário compartilhado.
+                    </p>
+                  </section>
+                )}
+
+                {moduloAtivo === 'desmoldante' && maquinaAtual && coletaAtual && (
+                  <section className="consumption-card">
+                    <div className="table-heading">
+                      <div>
+                        <p className="eyebrow">DESMOLDANTE · ESTOQUE POR COLETA</p>
+                        <h2>{maquinaAtual.nomeMaquina}</h2>
+                      </div>
+                      <span className="table-meta">
+                        {coletaAtual.idColeta}ª coleta
+                      </span>
+                    </div>
+                    <div className="consumption-fields">
+                      <CampoLitros
+                        id="estoque-inicial"
+                        label="Estoque inicial"
+                        value={maquinaAtual.desmoldante.estoqueInicialL}
+                        disabled={somenteLeitura || erroSincronizacao}
+                        erro={erroConsumo}
+                        onChange={(value) =>
+                          atualizarConsumo('estoqueInicialL', value, maquinaAtual)
+                        }
+                      />
+                      <CampoLitros
+                        id="reposicao"
+                        label="Reposição na coleta"
+                        value={maquinaAtual.desmoldante.reposicaoL}
+                        disabled={somenteLeitura || erroSincronizacao}
+                        erro={erroConsumo}
+                        onChange={(value) =>
+                          atualizarConsumo('reposicaoL', value, maquinaAtual)
+                        }
+                      />
+                      <CampoLitros
+                        id="estoque-final"
+                        label="Estoque final"
+                        value={maquinaAtual.desmoldante.estoqueFinalL}
+                        disabled={somenteLeitura || erroSincronizacao}
+                        erro={erroConsumo}
+                        onChange={(value) =>
+                          atualizarConsumo('estoqueFinalL', value, maquinaAtual)
+                        }
+                      />
+                      <div className="consumption-result">
+                        <span>Consumo calculado</span>
+                        <strong>
+                          {formatarLitros(consumoDesmoldante(maquinaAtual.desmoldante))}
+                        </strong>
+                        <small>Estoque inicial + reposição − estoque final</small>
+                      </div>
+                    </div>
+                    <p className="table-footer">
+                      Cada valor aceita de 0 a 13 L. Valores com mais de três casas decimais são arredondados.
+                      Campos vazios equivalem a zero.
+                    </p>
+                  </section>
+                )}
+              </>
+            )}
+          </section>
+        )}
       </main>
     </div>
   );

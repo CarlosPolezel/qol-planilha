@@ -1,0 +1,31 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "proxy": {
+    "entrypoint": "proxy.ts",
+    "matcher": ["/", "/login", "/dashboard", "/coletas"]
+  },
+  "rewrites": [
+    { "source": "/login", "destination": "/" },
+    { "source": "/dashboard", "destination": "/" },
+    { "source": "/coletas", "destination": "/" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        }
+      ]
+    }
+  ]
+}

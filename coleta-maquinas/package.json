@@ -5,13 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "tsc && vite build",
+    "dev:vercel": "vercel dev --listen 4173",
+    "dev:vite": "vite --host",
+    "build": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@e965/xlsx": "0.20.3",
+    "@vercel/blob": "^2.9.0",
+    "@vercel/functions": "^3.11.1",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "xlsx": "^0.18.5"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
@@ -20,6 +24,11 @@
     "@vitejs/plugin-react": "^6.1.1",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
+    "vercel": "^65.14.0",
     "vite": "^8.3.0"
+  },
+  "overrides": {
+    "@vercel/cli-config": "0.3.8",
+    "zod@^4": "4.6.7"
   }
 }
